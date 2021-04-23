@@ -1,0 +1,139 @@
+#include "FS.h"
+#include "SD_MMC.h"
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+#define CHUNK_SIZE 65536
+
+// ENTER YOUR WIFI and optionally a download link
+const char* ssid = "";
+const char* password = "";
+String download_url = "https://www2.cs.uic.edu/~i101/SoundFiles/preamble.wav";
+
+struct download_info_t {
+  String file_name;
+  String url;
+};
+
+download_info_t Download_info;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  // Initiate SD card
+  if (!SD_MMC.begin()) {
+    Serial.println("Card Mount Failed");
+  }
+
+  // Connect to wifi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("Wifi connected");
+
+  // Enter download url and name for new file
+  Download_info.file_name = "new_file.wav";
+  Download_info.url = download_url;
+
+  // Create download task
+  xTaskCreate(download_task, "downloader", 10000, &Download_info, 55, NULL);
+}
+
+void loop() {
+  vTaskDelay(10000);
+}
+
+void download_task(void* params) {
+  for (;;) {
+    download( ((download_info_t*)params)->file_name, ((download_info_t*)params)->url);
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    VTaskDelete();         // add vTaskDelete to stop loop from the existing code
+  }
+}
+
+bool download(String file_name, String download_url) {
+  // ********************* INIT HTTP *********************
+  HTTPClient http;
+  if (!http.begin(download_url) ) {
+    Serial.println("http.begin(download_url) error");
+    return false;
+  }
+
+  // ********************* SEND GET REQUEST *********************
+  size_t try_counter = 0;
+  const size_t TRY_LIMIT = 20;
+  int httpCode = -1;
+  do {
+    httpCode = http.GET();
+    Serial.print(".");
+    vTaskDelay(pdMS_TO_TICKS(250));
+    if (try_counter++ == TRY_LIMIT) {
+      Serial.println("Connection timeout");
+      return false;
+    }
+  } while (httpCode != HTTP_CODE_OK);
+  Serial.println("GET Success");
+
+  // ********************* RECEIVE FILE STREAM *********************
+  WiFiClient* stream = http.getStreamPtr();
+  try_counter = 0;
+  do {
+    stream = http.getStreamPtr();
+    vTaskDelay(pdMS_TO_TICKS(250));
+    Serial.print(".");
+    if (try_counter++ == TRY_LIMIT) {
+      Serial.println("Connection timeout");
+      return false;
+    }
+  } while (!stream->available());
+  Serial.println("File stream received");
+
+  // ********************* CREATE NEW FILE *********************
+  String fullpath = String("/sdcard/") + file_name;
+  FILE* file = fopen(fullpath.c_str(), "ab");
+  if (file == NULL) {
+    Serial.println("Error opening file");
+    return false;
+  }
+  Serial.println("Opened empty file");
+
+  // ********************* DOWNLOAD PROCESS *********************
+  uint8_t* buffer_ = (uint8_t*)malloc(CHUNK_SIZE);
+  uint8_t* cur_buffer = buffer_;
+  const size_t TOTAL_SIZE = http.getSize();
+  Serial.print("TOTAL SIZE : ");
+  Serial.println(TOTAL_SIZE);
+  size_t downloadRemaining = TOTAL_SIZE;
+  Serial.println("Download START");
+
+  auto start_ = millis();
+  while ( downloadRemaining > 0 && http.connected() ) {
+    auto data_size = stream->available();
+    if (data_size > 0) {
+      auto available_buffer_size = CHUNK_SIZE - (cur_buffer - buffer_);
+      auto read_count = stream->read(cur_buffer, ((data_size > available_buffer_size) ? available_buffer_size : data_size));
+      cur_buffer += read_count;
+      downloadRemaining -= read_count;
+      // If one chunk of data has been accumulated, write to SD card
+      if (cur_buffer - buffer_ == CHUNK_SIZE) {
+        write(fileno(file), buffer_, CHUNK_SIZE);
+        cur_buffer = buffer_;
+      }
+    }
+    vTaskDelay(1);
+  }
+  auto end_ = millis();
+  
+  Serial.println("Download END");
+
+  size_t time_ = (end_ - start_) / 1000;
+  String speed_ = String(TOTAL_SIZE / time_);
+  Serial.println("Speed: " + speed_ + " bytes/sec");
+  
+  fclose(file);
+  free(buffer_);
+  return true;
+}
